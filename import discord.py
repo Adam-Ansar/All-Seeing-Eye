@@ -4,7 +4,6 @@ import json
 import os
 import requests
 from datetime import datetime
-import os
 from dotenv import load_dotenv
 
 # Load environment variables for secure token storage
@@ -186,3 +185,4 @@ async def refresh(ctx):
 
 # Run the bot with token from environment variables
 # Store your token in a .env file or environment variable for security
+bot.run(os.getenv('DISCORD_TOKEN'))
