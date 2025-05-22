@@ -2,11 +2,16 @@ import json
 import os
 import random
 from dotenv import load_dotenv
-import re  # Required for cleaning HTML tags from skill descriptions
-
+import re
+import time
+import asyncio
+from thefuzz import fuzz, process
 import aiohttp
 import discord
 from discord.ext import commands
+from counter_hero_list import mlbb_hero_counters as COUNTER_HERO_LIST
+import openai
+from generalised_counter_reasoning import counter_groups
 
 # =========================
 # Configuration & Constants
@@ -37,10 +42,13 @@ COLORS = {
 # Bot Initialization
 # =========================
 
+bot_start_time = time.time()  # Track bot start time
+
 bot = commands.Bot(
     command_prefix="!",
     intents=intents,
     help_command=None,
+
     activity=discord.Activity(
         type=discord.ActivityType.watching, name="MLBB Statistics"
     ),
@@ -48,15 +56,178 @@ bot = commands.Bot(
 
 
 # =========================
-# Events
+# Global Hero Data Caches
 # =========================
 
+HERO_DETAILS_CACHE = {}       # hero_id (str) -> full hero detail JSON
+HERO_NAME_TO_ID_MAP = {}      # hero_name (lowercase str) -> hero_id (str)
+HERO_ID_TO_NAME_MAP = {}      # hero_id (str) -> hero_name (str)
+ACTIVE_TRIVIA_GAME = {}       # channel_id (int) -> bool
+
+# Helper Functions
+# =========================
+
+
+def clean_html_tags(text):
+    """Remove <font ...> and </font> tags from a string.
+    Handles non-string input."""
+    if not isinstance(text, str):
+        return ""
+    return re.sub(r'<font[^>]*>', '', text).replace('</font>', '')
+
+
+async def fetch_and_cache_hero_data():
+    """Fetch and cache all hero data at startup."""
+    global HERO_DETAILS_CACHE, HERO_NAME_TO_ID_MAP, HERO_ID_TO_NAME_MAP
+    # Clear caches at the very beginning of this function to ensure a fresh
+    # start
+    HERO_DETAILS_CACHE.clear()
+    HERO_NAME_TO_ID_MAP.clear()
+    HERO_ID_TO_NAME_MAP.clear()
+    print("DEBUG: Caches cleared before fetching new data.")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # --- Step 1: Fetch all hero IDs and names ---
+            hero_list_url = f"{BASE_API_URL}hero-list/"
+            print(f"DEBUG: Attempting to fetch hero list from: "
+                  f"{hero_list_url}")
+            async with session.get(hero_list_url) as resp:
+                resp.raise_for_status()
+                hero_list = await resp.json()
+                print(f"DEBUG: Successfully fetched hero list. Contains "
+                      f"{len(hero_list)} entries.")
+
+            hero_ids_to_fetch_details = []
+            for hero_id, hero_name in hero_list.items():
+                hero_id_str = str(hero_id)
+                lower_hero_name = hero_name.strip().lower()
+                HERO_NAME_TO_ID_MAP[lower_hero_name] = hero_id_str
+                HERO_ID_TO_NAME_MAP[hero_id_str] = hero_name
+                hero_ids_to_fetch_details.append(hero_id_str)
+            
+            print(f"DEBUG: Populated name-to-ID maps. Total heroes: "
+                  f"{len(HERO_NAME_TO_ID_MAP)}")
+
+            # --- Step 2: Concurrently fetch all hero details ---
+            async def fetch_hero_detail(session_inner, hero_id_str_inner):
+                detail_url = f"{BASE_API_URL}hero-detail/{hero_id_str_inner}/"
+                try:
+                    async with session_inner.get(detail_url) as resp_detail:
+                        resp_detail.raise_for_status()
+                        return hero_id_str_inner, await resp_detail.json()
+                except aiohttp.ClientError as e:
+                    # Log the specific network/client error for this hero
+                    print(f"⚠️ Network error fetching detail for ID "
+                          f"{hero_id_str_inner}: {e}")
+                    return hero_id_str_inner, None
+                except json.JSONDecodeError:
+                    # Log JSON decode errors for this hero
+                    print(f"⚠️ JSON decode error for hero ID "
+                          f"{hero_id_str_inner}.")
+                    return hero_id_str_inner, None
+                except Exception as e:
+                    # Catch any other unexpected errors
+                    print(f"⚠️ Unexpected error fetching detail for ID "
+                          f"{hero_id_str_inner}: {e}")
+                    return hero_id_str_inner, None
+
+            # Create tasks for all detail fetches, passing the session
+            tasks = [fetch_hero_detail(session, hid) for hid in
+                     hero_ids_to_fetch_details]
+            
+            # Run tasks concurrently, capturing exceptions
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            successful_fetches = 0
+            for result in results:
+                if isinstance(result, tuple) and len(result) == 2:
+                    hero_id_str_result, detail_json_result = result
+                    if detail_json_result:
+                        HERO_DETAILS_CACHE[hero_id_str_result] = \
+                            detail_json_result
+                        successful_fetches += 1
+                    else:
+                        hero_name_for_debug = HERO_ID_TO_NAME_MAP.get(
+                            hero_id_str_result, "Unknown Hero")
+                        print(f"DEBUG: Failed to cache details for "
+                              f"{hero_name_for_debug} (ID: "
+                              f"{hero_id_str_result}) due to API issue.")
+                elif isinstance(result, Exception):
+                    # An exception was returned directly from asyncio.gather
+                    print(f"DEBUG: An unhandled exception occurred during a "
+                          f"detail fetch: {result}")
+                else:
+                    print(f"DEBUG: Unexpected result format from fetch_hero_"
+                          f"detail: {result}")
+
+            print(f"DEBUG: Detail caching complete. Successfully cached "
+                  f"{successful_fetches} hero details.")
+            print(f"DEBUG: HERO_NAME_TO_ID_MAP size: "
+                  f"{len(HERO_NAME_TO_ID_MAP)}")
+            print(f"DEBUG: HERO_DETAILS_CACHE size: "
+                  f"{len(HERO_DETAILS_CACHE)}")
+
+            if "ling" in HERO_NAME_TO_ID_MAP:
+                print(f"DEBUG: 'ling' found in HERO_NAME_TO_ID_MAP. ID: "
+                      f"{HERO_NAME_TO_ID_MAP['ling']}")
+            else:
+                print("DEBUG: 'ling' NOT found in HERO_NAME_TO_ID_MAP.")
+            if "layla" in HERO_NAME_TO_ID_MAP:
+                print(f"DEBUG: 'layla' found in HERO_NAME_TO_ID_MAP. ID: "
+                      f"{HERO_NAME_TO_ID_MAP['layla']}")
+            else:
+                print("DEBUG: 'layla' NOT found in HERO_NAME_TO_ID_MAP.")
+
+        return True  # Indicate success
+    except aiohttp.ClientError as e:
+        print(f"❌ Network error fetching hero list: {e}")
+        return False
+    except json.JSONDecodeError:
+        print("❌ JSON decode error for hero list. API response might be "
+              "malformed.")
+        return False
+    except Exception as e:
+        print(f"❌ Unexpected error during initial hero list fetch: {e}")
+        return False
+
+
+async def background_hero_data_refresh():
+    """Periodically refresh hero data cache in the background."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        print("🔄 Refreshing hero data cache in background...")
+        success = await fetch_and_cache_hero_data()
+        if success:
+            print("✅ Hero data cache refreshed.")
+        else:
+            print("❌ Failed to refresh hero data cache.")
+        await asyncio.sleep(3600)  # Refresh every hour (3600 seconds)
+
+
+# =========================
+# Events
+# =========================
 
 @bot.event
 async def on_ready():
     """Handle bot startup."""
     print(f"✅ {bot.user} is connected to Discord!")
     print(f"Guilds: {len(bot.guilds)}")
+    print("⏳ Caching hero data...")
+    # Ensure caching completes before setting up background task
+    success = await fetch_and_cache_hero_data()
+    if success:
+        print("✅ Hero data cache complete.")
+    else:
+        print("❌ Hero data cache failed on startup.")
+    
+    # Start background refresh task only once after initial caching
+    if not hasattr(bot, "hero_refresh_task"):
+        bot.hero_refresh_task = bot.loop.create_task(
+            background_hero_data_refresh()
+        )
+        print("DEBUG: Background hero refresh task scheduled.")
 
 
 # =========================
@@ -69,29 +240,240 @@ async def on_ready():
 @bot.group(name="mlbb", invoke_without_command=True)
 async def mlbb(ctx):
     """Main command group for MLBB features."""
-    desc = (
-        "Your ultimate companion for MLBB statistics and rankings!\n\n"
-        "**Available Commands:**\n"
-        "`!mlbb ranks [rank] [days]` - Show top 10 hero rankings. "
-        "Filters: rank = all/epic/legend/mythic/honor/glory, days = 7/30\n"
-        "`!mlbb pick` - Get a random hero suggestion.\n"
-        "`!mlbb role pick` - Get a random role to play.\n"
-        "`!mlbb counter [hero]` - Show top 3 counters for a hero\n"
-        "`!ping` - Check bot latency.\n"
-        "`!mlbb help` - Show detailed help for all commands."
-    )
     embed = discord.Embed(
         title="🏆 Mobile Legends: Bang Bang Bot",
-        description=desc,
+        description="Your ultimate companion for MLBB statistics and fun!",
         color=COLORS["primary"],
     )
-    footer_text = (
-        f"Requested by {ctx.author.display_name} • "
-        "Use !mlbb help for more details."
+    embed.add_field(
+        name="📊 Hero & Game Stats",
+        value=(
+            "• `!mlbb ranks [rank] [days]` — Top 10 hero rankings\n"
+            "• `!mlbb counter [hero]` — Top 3 counters for a hero\n"
+            "• `!mlbb synergy [hero]` — Synergy & anti-synergy stats\n"
+            "• `!mlbb pick` — Get a random hero suggestion\n"
+            "• `!mlbb role pick` — Get a random role to play"
+        ),
+        inline=False,
     )
-    embed.set_footer(text=footer_text)
+    embed.add_field(
+        name="🎮 Fun & Utility",
+        value=(
+            "• `!mlbb trivia` — Start a MLBB trivia game *(moderator-only)*\n"
+            "• `!mlbb ping` — Check bot latency\n"
+            "• `!mlbb uptime` — Show bot uptime\n"
+            "• `!mlbb 8ball [question]` — Ask the Magic 8-Ball\n"
+            "• `!mlbb roast [@user]` — Roast yourself or a friend\n"
+            "• `!mlbb compliment [@user]`  - Compliment yourself or a friend\n"
+            "• `!mlbb crazy` — No idea what this is... did I code that?\n"
+            "• `!mlbb help` — Show detailed help for all commands"
+        ),
+        inline=False,
+    )
+    embed.set_footer(
+        text=(
+            f"Requested by {ctx.author.display_name} • "
+            "Use !mlbb help for more details."
+        )
+    )
     await ctx.send(embed=embed)
 
+
+@mlbb.command(name="trivia")
+@commands.has_permissions(manage_messages=True)
+async def trivia(ctx):
+    """Start a MLBB trivia game (moderator-only)."""
+    channel_id = ctx.channel.id
+    if ACTIVE_TRIVIA_GAME.get(channel_id):
+        await ctx.send(embed=discord.Embed(
+            title="❗ Trivia Already Running",
+            description="A trivia game is already active in this channel.",
+            color=COLORS["error"]
+        ))
+        return
+
+    if not HERO_DETAILS_CACHE:
+        await ctx.send(embed=discord.Embed(
+            title="⚠️ No Heroes Cached",
+            description="Hero data is not loaded yet. Please try again later.",
+            color=COLORS["error"]
+        ))
+        return
+
+    ACTIVE_TRIVIA_GAME[channel_id] = True
+    try:
+        hero_id = random.choice(list(HERO_DETAILS_CACHE.keys()))
+        # Corrected path for hero_info in trivia command
+        hero_info = (
+            HERO_DETAILS_CACHE[hero_id]
+            .get("data", {})
+            .get("records", [{}])[0]
+            .get("data", {})
+        )
+        qtype = random.choice(
+            ["role", "lane", "background"]
+        )  # Define qtype here
+
+        correct_answer = None  # Initialize correct_answer
+        question_text = None    # Initialize question_text
+
+        if qtype == "role":
+            role = (
+                hero_info.get("hero", {})
+                .get("data", {})
+                .get("sortlabel", ["Unknown"])
+            )
+            correct_answer = role[0] if role else "Unknown"
+            hero_name = HERO_ID_TO_NAME_MAP.get(hero_id, "Unknown Hero")
+            question_text = (
+                f"Which **role** does **{hero_name}** primarily belong to?"
+            )
+        elif qtype == "lane":
+            lane = (
+                hero_info.get("hero", {})
+                .get("data", {})
+                .get("roadsortlabel", ["Unknown"])
+            )
+            correct_answer = lane[0] if lane else "Unknown"
+            hero_name = HERO_ID_TO_NAME_MAP.get(hero_id, "Unknown Hero")
+            question_text = (
+                f"Which **lane** is recommended for **{hero_name}**?"
+            )
+        elif qtype == "background":
+            bg = clean_html_tags(hero_info.get("background", ""))
+            hero_name = HERO_ID_TO_NAME_MAP.get(hero_id, "Unknown Hero")
+            
+            # Split background into sentences and try to pick one
+            sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', bg)
+                         if s.strip()]
+
+            if not sentences or len(bg) < 50:  # If no sentences or too short
+                qtype = "role"  # Fallback to role question
+                role = (
+                    hero_info.get("hero", {})
+                    .get("data", {})
+                    .get("sortlabel", ["Unknown"])
+                )
+                correct_answer = role[0] if role else "Unknown"
+                question_text = (
+                    f"Which **role** does **{hero_name}** primarily "
+                    f"belong to?"
+                )
+            else:
+                # Select a random sentence or a short excerpt
+                chosen_excerpt = random.choice(sentences)
+                if len(chosen_excerpt) > 150:  # Truncate long sentences
+                    chosen_excerpt = chosen_excerpt[:150] + "..."
+                
+                correct_answer = hero_name.lower()
+                question_text = (f"I am thinking of a hero whose background "
+                                 f"story includes: \"*{chosen_excerpt}*\". "
+                                 f"Who is this hero?")
+        else:
+            correct_answer = "Unknown"
+            question_text = "Question type is unknown."
+
+        if not correct_answer or not question_text:
+            raise ValueError("Failed to generate trivia question.")
+
+        embed = discord.Embed(
+            title="MLBB Trivia",
+            description=question_text,
+            color=COLORS["info"]
+        )
+        await ctx.send(embed=embed)
+
+        def check(m):
+            return (
+                m.channel == ctx.channel and not m.author.bot
+            )
+
+        try:
+            msg = await ctx.bot.wait_for('message', timeout=30.0, check=check)
+            user_answer = msg.content.strip().lower()
+            
+            similarity = fuzz.WRatio(user_answer, correct_answer.lower())
+            if similarity >= 85:
+                await ctx.send(
+                    embed=discord.Embed(
+                        title="🎉 Correct!",
+                        description=(
+                            f"{msg.author.mention} got it right! "
+                            f"The answer was **{correct_answer.title()}**."
+                        ),
+                        color=COLORS["success"]
+                    )
+                )
+            else:
+                await ctx.send(
+                    embed=discord.Embed(
+                        title="❌ Incorrect!",
+                        description=(
+                            f"Sorry, {msg.author.mention}, that's incorrect. "
+                            f"The correct answer was "
+                            f"**{correct_answer.title()}**."
+                        ),
+                        color=COLORS["error"]
+                    )
+                )
+        except asyncio.TimeoutError:
+            await ctx.send(
+                embed=discord.Embed(
+                    title="⏰ Time's up!",
+                    description="No one answered in time!",
+                    color=COLORS["error"]
+                )
+            )
+        except Exception as e:
+            await ctx.send(
+                embed=discord.Embed(
+                    title="⚠️ Error",
+                    description=f"An error occurred: {str(e)}",
+                    color=COLORS["error"]
+                )
+            )
+    except (KeyError, IndexError):
+        await ctx.send(embed=discord.Embed(
+            title="⚠️ Error",
+            description=(
+                "Failed to generate trivia question. Please try again."
+            ),
+            color=COLORS["error"]
+        ))
+    except ValueError as e:
+        await ctx.send(
+            embed=discord.Embed(
+                title="⚠️ Error",
+                description=f"Failed to generate trivia question: {e}",
+                color=COLORS["error"]
+            )
+        )
+    finally:
+        ACTIVE_TRIVIA_GAME[channel_id] = False
+
+
+@trivia.error
+async def trivia_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send(
+            embed=discord.Embed(
+                title="🚫 Permission Denied",
+                description=(
+                    "You need the **Manage Messages** permission to use "
+                    "this command."
+                ),
+                color=COLORS["error"],
+            )
+        )
+    else:
+        await ctx.send(embed=discord.Embed(
+            title="⚠️ Trivia Error",
+            description="An error occurred while running the trivia command.",
+            color=COLORS["error"]
+        ))
+
+
+# ---- Update Help Command ----
 
 @mlbb.command(name="help")
 async def help_command(ctx):
@@ -100,8 +482,7 @@ async def help_command(ctx):
         title="📚 MLBB Bot Help & Support",
         description=(
             "If you need help or found a bug, please contact a "
-            "server moderator "
-            "(preferably anyone other than Bachkeda 😉).\n\n"
+            "server moderator (preferably anyone other than Bachkeda 😉).\n\n"
             "Below are all available MLBB bot commands and usage tips."
         ),
         color=COLORS["info"],
@@ -113,81 +494,281 @@ async def help_command(ctx):
             "• `rank`: all, epic, legend, mythic, honor, glory\n"
             "• `days`: 7 or 30\n"
             "Example: `!mlbb ranks mythic 30`\n"
-            "`!mlbb counter [hero]` — Top 3 counters for a hero,\n"
+            "`!mlbb counter [hero]` — Top 3 counters for a hero, "
             "with details.\n"
+            "`!mlbb synergy [hero]` — Synergy & anti-synergy stats "
+            "for a hero.\n"
             "`!mlbb pick` — Get a random hero suggestion.\n"
             "`!mlbb role pick` — Get a random role to play."
         ),
         inline=False,
     )
     embed.add_field(
-        name="Utility",
+        name="Fun & Utility",
         value=(
+            "`!mlbb trivia` — Start a MLBB trivia game *(moderator-only)*\n"
             "`!mlbb ping` — Check bot latency.\n"
+            "`!mlbb uptime` — Show bot uptime.\n"
+            "`!mlbb 8ball [question]` — Ask the Magic 8-Ball.\n"
+            "`!mlbb roast` — Roast yourself or a friend.\n"
+            "`!mlbb crazy` — No idea who added that\n"
             "`!mlbb help` — Show this help and support menu."
         ),
-        inline=False,
+        inline=False
     )
-    embed.set_footer(
-        text="For more help, contact a server moderator (just not Bachkeda)."
+    embed.add_field(
+        name="Role Commands",
+        value=(
+            "`!mlbb role` — Show role command help.\n"
+            "`!mlbb role pick` — Get a random role to play."
+        ),
+        inline=False
     )
     await ctx.send(embed=embed)
 
 
+# ---- Hero Commands ----
 @mlbb.command(name="pick")
+@commands.cooldown(1, 5, commands.BucketType.user)  # 1 use per 5 seconds per
 async def random_hero(ctx):
     """Randomly select a hero for players to use."""
-    api_url = f"{BASE_API_URL}hero-list/"
+    if not HERO_NAME_TO_ID_MAP:
+        error_embed = discord.Embed(
+            title="⚠️ No Heroes Cached",
+            description="Hero data is not loaded yet. "
+                        "Please try again later.",
+            color=COLORS["error"],
+        )
+        await ctx.send(embed=error_embed)
+        return
+    hero_names = list(HERO_NAME_TO_ID_MAP.keys())
+    selected_hero = random.choice(hero_names)
+    embed = discord.Embed(
+        title="🎲 Random Hero Selector",
+        description=(
+            f"**You should play:** "
+            f"{HERO_ID_TO_NAME_MAP[HERO_NAME_TO_ID_MAP[selected_hero]]}"
+        ),
+        color=COLORS["primary"],
+    )
+    await ctx.send(embed=embed)
+
+
+@mlbb.command(name="counter")
+async def counter(ctx, *, hero_name: str = None):
+    """
+    Show top 3 counters for the specified hero using COUNTER_HERO_LIST and
+    generalized reasoning. Prioritize by winrate using /api/hero-rank/.
+    """
+    if not HERO_NAME_TO_ID_MAP or not HERO_DETAILS_CACHE:
+        embed = discord.Embed(
+            title="⚠️ Hero Data Not Cached",
+            description="Hero data is not loaded yet. Please try again later.",
+            color=COLORS["error"],
+        )
+        await ctx.send(embed=embed)
+        return
+
+    if not hero_name:
+        embed = discord.Embed(
+            title="⚠️ Hero Name Required",
+            description=(
+                "Please specify a hero name. Example: `!mlbb counter Ling`"
+            ),
+            color=COLORS["error"],
+        )
+        await ctx.send(embed=embed)
+        return
+
+    hero_key = hero_name.strip().lower()
+    hero_id = HERO_NAME_TO_ID_MAP.get(hero_key)
+
+    # Fuzzy match if not found
+    if not hero_id:
+        # Find the closest match from HERO_NAME_TO_ID_MAP keys
+        choices = list(HERO_NAME_TO_ID_MAP.keys())
+        match, score = process.extractOne(hero_key, choices)
+        if score >= 80:  # Accept if similarity is high enough
+            hero_id = HERO_NAME_TO_ID_MAP[match]
+            hero_display_name = HERO_ID_TO_NAME_MAP.get(hero_id, match.title())
+        else:
+            embed = discord.Embed(
+                title="⚠️ Hero Not Found",
+                description=(
+                    f"Hero '{hero_name}' not found. Check spelling.\n"
+                    "Try `!mlbb pick` for an example."
+                ),
+                color=COLORS["error"],
+            )
+            await ctx.send(embed=embed)
+            return
+    else:
+        hero_display_name = HERO_ID_TO_NAME_MAP.get(hero_id, hero_name.title())
+
+    # Find counters from COUNTER_HERO_LIST
+    hero_counters = COUNTER_HERO_LIST.get(hero_display_name)
+    if not hero_counters or not isinstance(hero_counters, dict):
+        embed = discord.Embed(
+            title=f"🛡️ No Counter Data for {hero_display_name}",
+            description="No counter data available for this hero.",
+            color=COLORS["info"],
+        )
+        await ctx.send(embed=embed)
+        return
+
+    counters = hero_counters.get("weak_against", [])
+    if not counters:
+        embed = discord.Embed(
+            title=f"🛡️ No Counter Data for {hero_display_name}",
+            description="No counter data available for this hero.",
+            color=COLORS["info"],
+        )
+        await ctx.send(embed=embed)
+        return
+
+    # --- Fetch winrate data for prioritization ---
+    api_url = f"{BASE_API_URL}hero-rank/?rank=all&days=7"
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(api_url) as response:
                 response.raise_for_status()
-                data = await response.json()
-                # The API returns a dict: { "ID": "HeroName", ... }
-                if isinstance(data, dict) and data:
-                    hero_names = list(data.values())
-                else:
-                    print(
-                        "API hero list is not a dict or is empty. Response:",
-                        data
-                    )
-                    hero_names = []
+                json_data = await response.json()
+                hero_records = json_data.get("data", {}).get("records", [])
+    except Exception:
+        hero_records = []
 
-                if not hero_names:
-                    error_embed = discord.Embed(
-                        title="⚠️ No Heroes Found",
-                        description=(
-                            "Could not retrieve hero list from the API."
-                        ),
-                        color=COLORS["error"],
-                    )
-                    await ctx.send(embed=error_embed)
-                    return
+    # Build a mapping: hero name (lower) -> winrate
+    winrate_map = {}
+    for record in hero_records:
+        hero_data = record.get("data", {})
+        name = (
+            hero_data.get("main_hero", {})
+            .get("data", {})
+            .get("name", "")
+        )
+        win_rate = hero_data.get("main_hero_win_rate", 0)
+        if name:
+            winrate_map[name.strip().lower()] = win_rate
 
-                selected_hero = random.choice(hero_names)
-                embed = discord.Embed(
-                    title="🎲 Random Hero Selector",
-                    description=f"**You should play:** {selected_hero}",
-                    color=COLORS["primary"],
-                )
-                await ctx.send(embed=embed)
-    except aiohttp.ClientError as e:
-        print(f"AIOHTTP ClientError in random_hero: {e}")
-        error_embed = discord.Embed(
-            title="⚠️ API Error During Hero Pick",
-            description="Could not fetch hero list from the API.",
-            color=COLORS["error"],
+    # Sort counters by winrate (descending), fallback to original order
+    def counter_sort_key(counter_name):
+        return winrate_map.get(counter_name.strip().lower(), 0)
+
+    sorted_counters = sorted(counters, key=counter_sort_key, reverse=True)
+    top_counters = sorted_counters[:3]
+
+    embed = discord.Embed(
+        title=f"🛡️ Top Counters for {hero_display_name}",
+        color=COLORS["primary"],
+    )
+
+    async def get_openai_reason(hero, counter):
+        prompt = (
+            f"In Mobile Legends, explain in 2-3 sentences why {counter} is a "
+            f"strong counter to {hero}. Focus on gameplay mechanics, skills, "
+            "and matchups. Avoid generic statements."
         )
-        await ctx.send(embed=error_embed)
-    except json.JSONDecodeError as e:
-        print(f"JSONDecodeError in random_hero: {e}")
-        error_embed = discord.Embed(
-            title="⚠️ Oops! Something Went Wrong During Hero Pick",
-            description=f"An unexpected error occurred: {e}",
-            color=COLORS["error"],
-        )
-        await ctx.send(embed=error_embed)
+        try:
+            response = await openai.ChatCompletion.acreate(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=100,
+                temperature=0.7,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception:
+            return "No detailed reason available."
+
+    def get_group_reason(counter_hero):
+        for group in counter_groups.values():
+            if "heroes" in group and any(
+                h.lower() == counter_hero.lower() for h in group["heroes"]
+            ):
+                return group["reason"]
+        return None
+
+    # Show up to 3 counters
+    for idx, counter_hero in enumerate(top_counters, 1):
+        counter_id = HERO_NAME_TO_ID_MAP.get(counter_hero.lower())
+        counter_name = counter_hero
         
+        # Ensure counter_id is not None before proceeding to fetch details
+        if not counter_id:
+            print(f"DEBUG: Skipping counter '{counter_name}' as its ID was "
+                  f"not found in cache.")
+            continue  # Skip this counter if its ID isn't in the map
+
+        counter_full_data = HERO_DETAILS_CACHE.get(counter_id, {})
+        
+        # Corrected path to the nested hero data within the full detail JSON
+        hero_details_for_counter = (
+            counter_full_data.get("data", {})
+            .get("records", [{}])[0]
+            .get("data", {})
+        )
+
+        role = (
+            hero_details_for_counter.get("hero", {})
+            .get("data", {})
+            .get("sortlabel", ["Unknown"])[0]
+            if hero_details_for_counter.get("hero", {})
+            .get("data", {})
+            .get("sortlabel") else "Unknown"
+        )
+        specialties = (
+            ", ".join(hero_details_for_counter.get("hero", {})
+                      .get("data", {})
+                      .get("speciality", []))
+            if hero_details_for_counter.get("hero", {})
+            .get("data", {})
+            .get("speciality") else "Unknown"
+        )
+
+        # Try to get a reason from generalised_counter_reasoning
+        reason = get_group_reason(counter_name)
+
+        # If not found, use OpenAI
+        if not reason or len(reason) < 15:
+            reason = await get_openai_reason(hero_display_name, counter_name)
+
+        # Skills summary (show up to 2, only names)
+        skills_to_display = []
+        # Correct path to heroskilllist within the cached hero_info
+        heroskilllist = (
+            hero_details_for_counter.get("hero", {})
+            .get("data", {})
+            .get("heroskilllist", [])
+        )
+        for group in heroskilllist:
+            for skill in group.get("skilllist", []):
+                if len(skills_to_display) >= 2:
+                    break
+                skill_name = skill.get("skillname", "Skill")
+                skills_to_display.append(f"• {skill_name}")
+            if len(skills_to_display) >= 2:
+                break
+
+        attributes_summary = (
+            f"Key Counter Attributes: {specialties}"
+            if specialties != "Unknown" else ""
+        )
+
+        # Removed winrate_display section
+
+        field_value = (
+            f"**Reason:** {reason}\n"
+            f"{attributes_summary}\n"
+            f"**Key Skills:**\n" +
+            ("\n".join(skills_to_display) if skills_to_display
+             else "No skill data.")
+        )
+
+        field_name = f"#{idx} {counter_name} ({role})"
+        embed.add_field(name=field_name, value=field_value, inline=False)
+
+    embed.set_footer(text=f"Requested by {ctx.author.display_name}")
+    await ctx.send(embed=embed)
+
 
 @mlbb.command(name="ranks")
 async def ranks(ctx, rank_filter: str = "all", days_filter: int = 7):
@@ -352,441 +933,420 @@ async def ranks(ctx, rank_filter: str = "all", days_filter: int = 7):
         await ctx.send(embed=error_embed)
 
 
-# ---- Counter Command ----
+@mlbb.command(name="synergy")
+@commands.cooldown(1, 5, commands.BucketType.user)  # 1 use per 5 seconds per
+async def mlbb_synergy(ctx, *, hero_name: str = None):
+    """
+    Show advanced synergy and anti-synergy stats for a hero, including
+    best/worst partners, win/appearance rates, and time-segment trends.
+    Usage: !mlbb synergy [hero]
+    """
+    if not HERO_NAME_TO_ID_MAP or not HERO_DETAILS_CACHE:
+        await ctx.send(embed=discord.Embed(
+            title="⚠️ Hero Data Not Cached",
+            description="Hero data is not loaded yet. Please try again later.",
+            color=COLORS["error"],
+        ))
+        return
 
-
-@mlbb.command(name="counter")
-async def counter(ctx, *, hero_name: str = None):
-    """Show top 3 counters for the specified hero with hero details."""
-
-    print(
-        f"DEBUG: !mlbb counter command received with hero_name='{hero_name}'"
-    )
     if not hero_name:
-        embed = discord.Embed(
+        await ctx.send(embed=discord.Embed(
             title="⚠️ Hero Name Required",
             description=(
-                "Please specify a hero name. Example: `!counter Ling`"
+                "Please specify a hero name. Example: `!mlbb synergy Ling`"
             ),
             color=COLORS["error"],
+        ))
+        return
+
+    hero_key = hero_name.strip().lower()
+    hero_id = HERO_NAME_TO_ID_MAP.get(hero_key)
+
+    # Fuzzy match if not found
+    if not hero_id:
+        choices = list(HERO_NAME_TO_ID_MAP.keys())
+        match, score = process.extractOne(hero_key, choices)
+        if score >= 80:
+            hero_id = HERO_NAME_TO_ID_MAP[match]
+            hero_display_name = HERO_ID_TO_NAME_MAP.get(hero_id, match.title())
+        else:
+            await ctx.send(embed=discord.Embed(
+                title="⚠️ Hero Not Found",
+                description=f"Hero '{hero_name}' not found. Check spelling.",
+                color=COLORS["error"],
+            ))
+            return
+    else:
+        hero_display_name = HERO_ID_TO_NAME_MAP.get(hero_id, hero_name.title())
+
+    api_url = f"{BASE_API_URL}hero-detail-stats/{hero_id}/"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url) as response:
+                response.raise_for_status()
+                json_data = await response.json()
+    except Exception as e:
+        await ctx.send(embed=discord.Embed(
+            title="⚠️ API Error",
+            description=f"Failed to fetch synergy data: {e}",
+            color=COLORS["error"],
+        ))
+        return
+
+    records = json_data.get("data", {}).get("records", [])
+    if not records:
+        await ctx.send(embed=discord.Embed(
+            title="⚠️ No Synergy Data",
+            description="No synergy data found for this hero.",
+            color=COLORS["error"],
+        ))
+        return
+
+    hero_stats = records[0]["data"]
+    main_win = hero_stats.get("main_hero_win_rate", 0)
+    main_pick = hero_stats.get("main_hero_appearance_rate", 0)
+    main_ban = hero_stats.get("main_hero_ban_rate", 0)
+    sub_hero = hero_stats.get("sub_hero", [])
+    sub_hero_last = hero_stats.get("sub_hero_last", [])
+
+    def format_time_segments(h):
+        # Collect all min_win_rate* fields
+        segments = []
+        for k in [
+            "min_win_rate6_8", "min_win_rate8_10", "min_win_rate10_12",
+            "min_win_rate12_14", "min_win_rate14_16", "min_win_rate16_18",
+            "min_win_rate18_20", "min_win_rate20"
+        ]:
+            if k in h:
+                segments.append(f"`{k[12:].replace('_', '-')}`: {h[k]:.2%}")
+        return " | ".join(segments) if segments else "No time-segment data."
+
+    embed = discord.Embed(
+        title=f"🤝 Synergy Stats for {hero_display_name}",
+        description=(
+            f"**Win Rate:** `{main_win:.2%}` | "
+            f"Pick Rate: `{main_pick:.2%}` | "
+            f"Ban Rate: `{main_ban:.2%}`\n"
+            f"Top synergy and anti-synergy partners below.\n\n"
+            f"**What is 'Win Rate by Time'?**\n"
+            "Shows how the win rate for the hero pairing changes depending on "
+            "how long the match lasts. "
+            "For example, `14-16` means the win rate when games last between "
+            "14 and 16 minutes."
+        ),
+        color=COLORS["primary"],
+    )
+
+    # Top synergy partners
+    if sub_hero:
+        for h in sub_hero[:3]:
+            heroid = h.get("heroid")
+            name = HERO_ID_TO_NAME_MAP.get(str(heroid), f"ID {heroid}")
+            wr = h.get("hero_win_rate", 0)
+            pr = h.get("hero_appearance_rate", 0)
+            wr_diff = h.get("increase_win_rate", 0)
+            time_seg = format_time_segments(h)
+            embed.add_field(
+                name=f"🟢 {name} (+{wr_diff:.2%} WR)",
+                value=(
+                    f"Win Rate: `{wr:.2%}` | Appearance: `{pr:.2%}`\n"
+                    f"Win Rate by Time: {time_seg}"
+                ),
+                inline=False,
+            )
+    else:
+        embed.add_field(
+            name="🟢 No strong synergy partners found.",
+            value="No positive synergy data.",
+            inline=False,
+        )
+
+    # Top anti-synergy partners
+    if sub_hero_last:
+        for h in sub_hero_last[:2]:
+            heroid = h.get("heroid")
+            name = HERO_ID_TO_NAME_MAP.get(str(heroid), f"ID {heroid}")
+            wr = h.get("hero_win_rate", 0)
+            pr = h.get("hero_appearance_rate", 0)
+            wr_diff = h.get("increase_win_rate", 0)
+            time_seg = format_time_segments(h)
+            embed.add_field(
+                name=f"🔴 {name} ({wr_diff:.2%} WR)",
+                value=(
+                    f"Win Rate: `{wr:.2%}` | Appearance: `{pr:.2%}`\n"
+                    f"Win Rate by Time: {time_seg}"
+                ),
+                inline=False,
+            )
+    else:
+        embed.add_field(
+            name="🔴 No negative synergy partners found.",
+            value="No anti-synergy data.",
+            inline=False,
+        )
+
+    embed.set_footer(text=f"Requested by {ctx.author.display_name}")
+    await ctx.send(embed=embed)
+
+
+@mlbb.command(name="roast")
+@commands.cooldown(1, 10, commands.BucketType.user)  # 1 use per 10 seconds per
+async def roast(ctx, member: discord.Member = None):
+    """
+    Delivers a hilarious roast to a user or the invoker.
+    Usage: !mlbb roast [optional @user]
+    """
+    roast_lines = [
+        "Your win rate is so low, even AFK players question your dedication.",
+        "I've seen better rotations from a broken washing machine.",
+        "You play so safe, you make Estes look aggressive.",
+        "Your KDA is so bad, even your teammates think you're an enemy spy.",
+        "I bet you play without a mini-map, don't you?",
+        "You're the reason they invented the surrender button.",
+        "Did you accidentally pick a support and then forget to support?",
+        "Your micro skills are worse than a broken joystick.",
+        "You're like a walking bush: always there, never useful.",
+        "If MLBB was a school, you'd be held back a rank.",
+        "I've seen better ganks from a minion wave.",
+        "Your last hit game is so weak, even the jungle creeps laugh at you.",
+        "You ping 'Request Backup' more often than you use your ult.",
+        "Even Layla has better escape skills than you.",
+        "You die so much, they should call you 'Respawn Timer'.",
+        "Your turret dives are bolder than your life choices.",
+        "I've seen slower internet connections than your reaction time."
+    ]
+
+    chosen_roast = random.choice(roast_lines)
+
+    if member:
+        # If a member is mentioned, roast them
+        embed = discord.Embed(
+            title="🔥 Roast Session! 🔥",
+            description=f"{member.mention}, {chosen_roast}",
+            color=COLORS["primary"]  # Or a 'roast' specific color
+        )
+    else:
+        # If no member is mentioned, roast the invoker
+        embed = discord.Embed(
+            title="🔥 Self-Roast! 🔥",
+            description=f"{ctx.author.mention}, {chosen_roast}",
+            color=COLORS["primary"]
+        )
+
+    embed.set_footer(text=f"Requested by {ctx.author.display_name}")
+    await ctx.send(embed=embed)
+
+
+@mlbb.command(name="crazy")
+@commands.cooldown(1, 10, commands.BucketType.user)  # 1 use per 10 seconds per
+async def mlbb_crazy(ctx):
+    """Responds with the 'crazy' copypasta."""
+    lines = [
+        "Crazy?",
+        "I was crazy once",
+        "They locked me in a room",
+        "A rubber room",
+        "A rubber room with rats",
+        "And rats make me crazy!"
+    ]
+    await ctx.send("\n".join(lines))
+
+
+@mlbb.command(name="8ball")
+@commands.cooldown(1, 5, commands.BucketType.user)  # 1 use per 5 seconds per
+async def eightball(ctx, *, question: str):
+    """
+    Ask the Magic 8-Ball a question.
+    Usage: !mlbb 8ball [your question]
+    """
+    responses = [
+        "It is certain.",
+        "It is decidedly so.",
+        "Without a doubt.",
+        "Yes, definitely.",
+        "You may rely on it.",
+        "As I see it, yes.",
+        "Most likely.",
+        "Outlook good.",
+        "Yes.",
+        "Signs point to yes.",
+        "Reply hazy, try again.",
+        "Ask again later.",
+        "Better not tell you now.",
+        "Cannot predict now.",
+        "Concentrate and ask again.",
+        "Don't count on it.",
+        "My reply is no.",
+        "My sources say no.",
+        "Outlook not so good.",
+        "Very doubtful."
+    ]
+
+    if not question.endswith("?"):
+        embed = discord.Embed(
+            title="❓ Invalid Question",
+            description=(
+                "Please ask a question that ends with a question mark (?)."
+            ),
+            color=COLORS["error"]
         )
         await ctx.send(embed=embed)
         return
 
-    # Use a single session for all API calls within this command
-    async with aiohttp.ClientSession() as session:
-        try:
-            # --- Fetch hero list from API ---
-            api_url = f"{BASE_API_URL}hero-list/"
-            print(f"DEBUG: Fetching hero list from: {api_url}")
-            async with session.get(api_url) as response:
-                response.raise_for_status()  # Ensure success for hero list
-                api_data = await response.json()
-                print(f"DEBUG: Hero List API raw data (first 500 chars): "
-                      f"{str(api_data)[:500]}")
+    response = random.choice(responses)
 
-            name_to_id_map = (
-                {v.strip().lower(): k for k, v in api_data.items()}
-                if isinstance(api_data, dict) else {}
-            )
-            id_to_name_map = (
-                {k: v for k, v in api_data.items()}
-                if isinstance(api_data, dict) else {}
-            )
-
-            print(f"DEBUG: name_to_id_map size: {len(name_to_id_map)}")
-            print(f"DEBUG: id_to_name_map size: {len(id_to_name_map)}")
-
-            hero_id = name_to_id_map.get(hero_name.strip().lower())
-            print(f"DEBUG: Requested hero_name: '{hero_name}', "
-                  f"resolved hero_id: '{hero_id}'")
-            if not hero_id:
-                embed = discord.Embed(
-                    title="⚠️ Hero Not Found",
-                    description=(
-                        f"Hero '{hero_name}' not found. Check spelling.\n"
-                        "Try `!mlbb pick` for an example."
-                    ),
-                    color=COLORS["error"],
-                )
-                await ctx.send(embed=embed)
-                return
-
-            try:
-                hero_id_int = int(hero_id)
-            except ValueError:
-                print(f"ERROR: Hero ID '{hero_id}' could not be "
-                      f"converted to integer.")
-                embed = discord.Embed(
-                    title="⚠️ Internal Error",
-                    description="Hero ID could not be converted to integer.",
-                    color=COLORS["error"],
-                )
-                await ctx.send(embed=embed)
-                return
-
-            # --- Fetch Main Hero Detail Data (relations & reasons) ---
-            main_hero_detail_data = None
-            main_hero_relation_data = None
-            detail_url = f"{BASE_API_URL}hero-detail/{hero_id_int}/"
-            print(f"DEBUG: Fetching main hero detail from: {detail_url}")
-            try:
-                async with session.get(detail_url) as response:
-                    response.raise_for_status()  # Ensure success
-                    detail_data = await response.json()
-                    main_hero_detail_data = (
-                        detail_data.get("data", {})
-                        .get("records", [{}])[0]
-                        .get("data", {})
-                    )
-                    main_hero_relation_data = main_hero_detail_data.get(
-                        "relation"
-                    )
-                    print(f"DEBUG: Main hero detail API raw data "
-                          f"(first 500 chars): {str(detail_data)[:500]}")
-                    print(f"DEBUG: Extracted main_hero_relation_data: "
-                          f"{main_hero_relation_data}")
-            except aiohttp.ClientResponseError as e:
-                print(f"ERROR: API Response Error (Main Hero Detail): "
-                      f"Status={e.status}, Message={e.message}")
-            except aiohttp.ClientError as e:
-                print(f"ERROR: API Network Error (Main Hero Detail): {e}")
-            except json.JSONDecodeError:
-                print("ERROR: Invalid JSON response from Main Hero Detail "
-                      "API.")
-            except Exception as e:
-                print(
-                    f"ERROR: Unexpected error fetching Main Hero Detail: {e}"
-                )
-
-            # --- Fetch Counter Hero List ---
-            counter_url = f"{BASE_API_URL}hero-counter/{hero_id_int}/"
-            print(f"DEBUG: Fetching Hero Counter from: {counter_url}")
-            async with session.get(counter_url) as response:
-                response.raise_for_status()  # Ensure success
-                data = await response.json()
-                print(f"DEBUG: Hero Counter raw data (first 500 chars): "
-                      f"{str(data)[:500]}")
-
-            records = data.get("data", {}).get("records", [])
-            if not records or not records[0].get("data"):
-                embed = discord.Embed(
-                    title=f"🛡️ No Counter Data for {hero_name}",
-                    description="API returned no valid counter data.",
-                    color=COLORS["info"],
-                )
-                await ctx.send(embed=embed)
-                print("DEBUG: No valid records[0].data found in "
-                      "Hero Counter.")
-                return
-
-            counter_list = records[0]["data"].get("sub_hero", [])
-            print(f"DEBUG: Initial counter_list length from API: "
-                  f"{len(counter_list)}")
-
-            # --- Filter out self-counters and duplicates ---
-            valid_counters_for_display = []
-            added_hero_ids = set()
-            main_hero_id_str = str(hero_id)
-            print("DEBUG: Starting counter filtering loop.")
-            for counter_hero_entry in counter_list:
-                counter_hero_id_from_api = counter_hero_entry.get("heroid")
-                counter_hero_id_str = (
-                    str(counter_hero_id_from_api)
-                    if counter_hero_id_from_api is not None
-                    else None
-                )
-                print(f"DEBUG: Processing counter item heroid: "
-                      f"'{counter_hero_id_from_api}' for filtering.")
-                # Skip if self-counter or invalid or duplicate
-                if (
-                    counter_hero_id_str == main_hero_id_str
-                    or counter_hero_id_str is None
-                    or counter_hero_id_str in added_hero_ids
-                ):
-                    print(
-                        f"DEBUG: Skipping counter ID '{counter_hero_id_str}' "
-                        f"(Self-counter, invalid, or duplicate)."
-                    )
-                    continue
-                valid_counters_for_display.append(counter_hero_entry)
-                added_hero_ids.add(counter_hero_id_str)
-                if len(valid_counters_for_display) >= 3:
-                    print("DEBUG: Collected 3 valid counters. Breaking "
-                          "filtering loop.")
-                    break
-            print(f"DEBUG: Final valid_counters_for_display length "
-                  f"after filtering: {len(valid_counters_for_display)}")
-            # --- End filter ---
-
-            if not valid_counters_for_display:
-                embed = discord.Embed(
-                    title=f"🛡️ No Counters for {hero_name}",
-                    description="No specific counters from the API.",
-                    color=COLORS["info"],
-                )
-                await ctx.send(embed=embed)
-                print("DEBUG: No valid distinct counter heroes "
-                      "after filtering.")
-                return
-
-            # --- Fetch Details for Each Counter Hero ---
-            counter_hero_details = {}
-            print("DEBUG: Starting fetch for each counter hero's details.")
-            for counter_hero_entry in valid_counters_for_display:
-                counter_heroid_str = str(counter_hero_entry.get("heroid"))
-                detail_url = (
-                    f"{BASE_API_URL}hero-detail/{counter_heroid_str}/"
-                )
-                print(f"DEBUG: Fetching detail for counter ID "
-                      f"'{counter_heroid_str}' from: {detail_url}")
-                try:
-                    async with session.get(detail_url) as resp:
-                        resp.raise_for_status()  # Ensure success
-                        detail_json = await resp.json()
-                        hero_data = (
-                            detail_json.get("data", {})
-                            .get("records", [{}])[0]
-                            .get("data", {})
-                        )
-                        counter_hero_details[counter_heroid_str] = hero_data
-                        print(f"DEBUG: Successfully fetched detail for "
-                              f"'{counter_heroid_str}'.")
-                except aiohttp.ClientResponseError as e:
-                    print(f"ERROR: API Request Error (Counter Hero Detail "
-                          f"'{counter_heroid_str}'): Status={e.status}, "
-                          f"Message={e.message}")
-                    counter_hero_details[counter_heroid_str] = {}
-                except aiohttp.ClientError as e:
-                    print(f"ERROR: API Network Error (Counter Hero Detail "
-                          f"'{counter_heroid_str}'): {e}")
-                    counter_hero_details[counter_heroid_str] = {}
-                except json.JSONDecodeError:
-                    print(f"ERROR: Invalid JSON response from Counter Hero "
-                          f"Detail API for '{counter_heroid_str}'.")
-                    counter_hero_details[counter_heroid_str] = {}
-                except Exception as e:
-                    print(f"ERROR: Unexpected error fetching detail for "
-                          f"counter hero '{counter_heroid_str}': {e}")
-                    counter_hero_details[counter_heroid_str] = {}
-            print("DEBUG: Finished fetching all counter hero details.")
-
-            # --- Build Embed ---
-            embed = discord.Embed(
-                title=f"🛡️ Top Counters for {hero_name}",
-                color=COLORS["primary"],
-            )
-
-            for idx, counter_hero_entry in enumerate(
-                valid_counters_for_display, 1
-            ):
-                counter_hero_id_from_api = counter_hero_entry.get("heroid")
-                counter_hero_id_str = (
-                    str(counter_hero_id_from_api)
-                    if counter_hero_id_from_api is not None
-                    else None
-                )
-                counter_hero_name = id_to_name_map.get(
-                    counter_hero_id_str, "Unknown Hero (ID not in map)"
-                )
-                print(f"DEBUG: Building embed field for counter: "
-                      f"{counter_hero_name} (ID: {counter_hero_id_str})")
-
-                reason_text = ("Specific counter reason for this hero not "
-                               "available from API.")
-                if main_hero_relation_data and counter_hero_id_str:
-                    strong_relations = main_hero_relation_data.get(
-                        "strong", {}
-                    )
-                    weak_relations = main_hero_relation_data.get(
-                        "weak", {}
-                    )
-
-                    strong_ids = [
-                        str(x)
-                        for x in strong_relations.get("target_hero_id", [])
-                    ]
-                    weak_ids = [
-                        str(x)
-                        for x in weak_relations.get("target_hero_id", [])
-                    ]
-                    
-                    if (
-                        counter_hero_id_str in strong_ids
-                        and strong_relations.get("desc")
-                    ):
-                        reason_text = strong_relations["desc"]
-                        print(f"DEBUG: Reason found (strong): {reason_text}")
-                    elif (
-                        counter_hero_id_str in weak_ids
-                        and weak_relations.get("desc")
-                    ):
-                        reason_text = (
-                            f"Exploits {hero_name}'s weakness: "
-                            f"{weak_relations['desc']}"
-                        )
-                        print(f"DEBUG: Reason found (weak): {reason_text}")
-                    else:
-                        print(f"DEBUG: Counter ID '{counter_hero_id_str}' not "
-                              f"found in strong/weak relations with desc.")
-                else:
-                    print(f"DEBUG: main_hero_relation_data is None "
-                          f"({main_hero_relation_data}) or "
-                          f"counter_hero_id_str is None.")
-
-                # --- Extract and format Counter Hero's Key Information ---
-                hero_detail_data = counter_hero_details.get(
-                    counter_hero_id_str, {}
-                )
-                counter_hero_inner_data = (
-                    hero_detail_data.get("hero", {})
-                    .get("data", {})
-                )
-                
-                role = (
-                    counter_hero_inner_data.get("sortlabel", ["Unknown"])[0]
-                    if counter_hero_inner_data.get("sortlabel")
-                    else "Unknown"
-                )
-                
-                specialties = (
-                    ", ".join(counter_hero_inner_data.get("speciality", []))
-                    if counter_hero_inner_data.get("speciality")
-                    else "Unknown"
-                )
-
-                skills_to_display_list = []
-                skill_tags_for_summary = []
-                heroskilllist = counter_hero_inner_data.get(
-                    "heroskilllist", []
-                )
-
-                for group in heroskilllist:
-                    for skill in group.get("skilllist", []):
-                        if len(skills_to_display_list) >= 2:
-                            break
-                        skill_name = skill.get("skillname", "Skill")
-                        
-                        skill_tags_raw = skill.get("skilltag", [])
-                        tag_names = [
-                            tag.get("tagname", "") for tag in skill_tags_raw
-                            if tag.get("tagname")
-                        ]
-                        skill_tag_str_for_display = (
-                            ", ".join(tag_names) if tag_names else ""
-                        )
-                        skill_tags_for_summary.extend(tag_names)
-
-                        skill_desc = skill.get("skilldesc", "")
-                        
-                        cleaned_skill_desc = re.sub(
-                            r'<font[^>]*>', '', skill_desc
-                        ).replace('</font>', '')
-                        skill_brief = (
-                            skill_tag_str_for_display
-                            or (
-                                cleaned_skill_desc[:60] + "..."
-                                if len(cleaned_skill_desc) > 60
-                                else cleaned_skill_desc
-                            )
-                        )
-                        skills_to_display_list.append(
-                            f"**{skill_name}:** {skill_brief}"
-                        )
-                    if len(skills_to_display_list) >= 2:
-                        break
-
-                # Combine Specialties and Skill Tags for attributes summary
-                all_attributes = list(set(
-                    specialties.split(", ") + skill_tags_for_summary
-                ))
-                all_attributes = [
-                    attr for attr in all_attributes
-                    if attr and attr != "Unknown"
-                ]
-                attributes_summary_line = (
-                    f"Key Counter Attributes: {', '.join(all_attributes)}"
-                    if all_attributes else "No specific attributes."
-                )
-                
-                # Get win rate from counter_hero_entry (from hero-counter API)
-                win_rate = counter_hero_entry.get("increase_win_rate", None)
-                print(f"DEBUG: Raw increase_win_rate for "
-                      f"{win_rate}")
-
-                win_rate_suffix = ""
-                if isinstance(win_rate, (float, int)):
-                    win_rate_suffix = (
-                        f"Increases win rate by `{win_rate:.2%}`\n"
-                    )
-                print(f"DEBUG: win_rate_suffix for {win_rate} "
-                      f"'{win_rate_suffix.strip()}'")
-
-                # Compose value string with new order
-                skills_text = "\n".join(skills_to_display_list)
-                field_value = (
-                    f"**Reason:** {reason_text}\n"
-                    f"  {attributes_summary_line}\n"
-                    f"{win_rate_suffix}"
-                    f"**Key Skills:**\n{skills_text}"
-                )
-                print(f"DEBUG: Final field_value for {counter_hero_name} "
-                      f"(first 200 chars): {field_value[:200]}")
-
-                field_name = f"#{idx} {counter_hero_name} ({role})"
-                embed.add_field(name=field_name, value=field_value,
-                                inline=False)
-                print(f"DEBUG: Added field for {counter_hero_name}.")
-
-            if not embed.fields:
-                embed.description = ("Could not retrieve counter details or "
-                                     "found no valid counters.")
-                print("DEBUG: No fields added to embed.")
-
-            embed.set_footer(
-                text=f"Requested by {ctx.author.display_name}"
-            )
-        finally:
-            pass
-
-
-# ---- Utility Commands ----
-
-
-@mlbb.command(name="ping")
-async def mlbb_ping(ctx):
-    """Check bot latency as a subcommand of !mlbb."""
-    latency = round(ctx.bot.latency * 1000)
     embed = discord.Embed(
-        title="🏓 Pong!",
-        description=f"Bot latency: {latency}ms",
-        color=COLORS["success"],
+        title="🎱 Magic 8-Ball Says...",
+        description=f"**Question:** {question}\n**Answer:** {response}",
+        color=COLORS["info"]
+    )
+    embed.set_footer(text=f"Asked by {ctx.author.display_name}")
+    await ctx.send(embed=embed)
+
+
+@mlbb.command(name="uptime")
+async def mlbb_uptime(ctx):
+    """Show how long the bot has been running."""
+    uptime_seconds = int(time.time() - bot_start_time)
+    days, remainder = divmod(uptime_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    uptime_str = (
+        f"{days}d {hours}h {minutes}m {seconds}s"
+        if days else f"{hours}h {minutes}m {seconds}s"
+    )
+    embed = discord.Embed(
+        title="⏱️ Bot Uptime",
+        description=f"The bot has been running for **{uptime_str}**.",
+        color=COLORS["info"],
+    )
+    await ctx.send(embed=embed)
+
+# ---- Role Command Group ----
+
+
+@mlbb.group(name="role", invoke_without_command=True)
+async def mlbb_role(ctx):
+    """Group for role-related commands."""
+    embed = discord.Embed(
+        title="🎭 MLBB Role Commands",
+        description="Use `!mlbb role pick` to get a random role.",
     )
     await ctx.send(embed=embed)
 
 
-# ---- Role Pick Command ----
+@mlbb_role.command(name="pick")
+async def mlbb_role_pick(ctx):
+    """Randomly select a role for the player."""
+    roles = ["Tank", "Fighter", "Assassin", "Mage", "Marksman", "Support"]
+    selected_role = random.choice(roles)
+    embed = discord.Embed(
+        title="🎲 Random Role Selector",
+        description=f"**You should play:** {selected_role}",
+        color=COLORS["primary"],
+    )
+    await ctx.send(embed=embed)
 
-@mlbb.command(name="role")
-async def role_pick(ctx, subcommand: str = None):
+
+@mlbb.command(name="compliment")
+@commands.cooldown(1, 10, commands.BucketType.user)  # 1 use per 10 seconds
+async def compliment(ctx, member: discord.Member = None):
     """
-    Randomly pick a role for the user to play.
-    Usage: !mlbb role pick
+    Delivers a wholesome compliment to a user or the invoker.
+    Usage: !mlbb compliment [optional @user]
     """
-    if subcommand is not None and subcommand.lower() == "pick":
-        roles = ["Support", "Tank", "Fighter", "Marksman", "Mage", "Assassin"]
-        selected_role = random.choice(roles)
+    compliment_lines = [
+        "Your map awareness is sharper than a Ling dash!",
+        "You support your team better than Estes on a healing spree.",
+        "Your rotations are smoother than Lancelot's dashes.",
+        "You make every game feel like a Mythic rank match.",
+        "Your positivity is more contagious than Angela's heartguard.",
+        "You land skills as precisely as Selena's arrows.",
+        "Your teamfights are legendary—like a Lord steal at 20 minutes.",
+        "You inspire your squad more than a Franco hook lands.",
+        "You farm gold faster than a jungle emblem on steroids.",
+        "You bring more joy to the team than a Layla with full build.",
+        "Your shotcalling is as clear as Kagura's umbrella path.",
+        "You make even defeat feel like a victory.",
+        "You dodge skills better than Wanwan in crossbow mode.",
+        "Your presence is as game-changing as a surprise Lord push.",
+        "You’re the MVP, even when the scoreboard disagrees.",
+        "You make every hero look S-tier.",
+        "Your gameplay is the real highlight of the match!"
+    ]
+
+    chosen_compliment = random.choice(compliment_lines)
+
+    if member:
+        # Compliment the mentioned member
         embed = discord.Embed(
-            title="🎲 Random Role Picker",
-            description=f"**You should play:** {selected_role}",
-            color=COLORS["primary"],
+            title="🌟 Compliment Time! 🌟",
+            description=f"{member.mention}, {chosen_compliment}",
+            color=COLORS["success"]
+        )
+    else:
+        # Compliment the invoker
+        embed = discord.Embed(
+            title="🌟 Self-Compliment! 🌟",
+            description=f"{ctx.author.mention}, {chosen_compliment}",
+            color=COLORS["success"]
+        )
+
+    embed.set_footer(text=f"Requested by {ctx.author.display_name}")
+    await ctx.send(embed=embed)
+
+
+@compliment.error
+async def compliment_error(ctx, error):
+    if isinstance(error, commands.CommandOnCooldown):
+        embed = discord.Embed(
+            title="⏳ Slow Down!",
+            description=(
+                "That command is on cooldown. "
+                f"Try again in `{error.retry_after:.1f}` seconds."
+            ),
+            color=COLORS["error"]
         )
         await ctx.send(embed=embed)
-    else:
+
+
+@roast.error
+async def roast_error(ctx, error):
+    if isinstance(error, commands.CommandOnCooldown):
         embed = discord.Embed(
-            title="ℹ️ Usage: !mlbb role pick",
-            description="Use `!mlbb role pick` to get a random role pick.",
-            color=COLORS["info"],
+            title="⏳ Whoa There!",
+            description=(
+                "Roast is on cooldown. "
+                f"Try again in `{error.retry_after:.1f}` seconds."
+            ),
+            color=COLORS["error"]
+        )
+        await ctx.send(embed=embed)
+
+
+@mlbb_crazy.error
+async def crazy_error(ctx, error):
+    if isinstance(error, commands.CommandOnCooldown):
+        embed = discord.Embed(
+            title="⏳ Not So Fast!",
+            description=(
+                "That command is on cooldown. "
+                f"Try again in `{error.retry_after:.1f}` seconds."
+            ),
+            color=COLORS["error"]
+        )
+        await ctx.send(embed=embed)
+
+
+@eightball.error
+async def eightball_error(ctx, error):
+    if isinstance(error, commands.CommandOnCooldown):
+        embed = discord.Embed(
+            title="⏳ Magic 8-Ball Needs a Break!",
+            description=(
+                f"Try again in `{error.retry_after:.1f}` seconds."
+            ),
+            color=COLORS["error"]
         )
         await ctx.send(embed=embed)
 
