@@ -587,6 +587,8 @@ async def random_hero(ctx):
 
 
 @mlbb.command(name="counter")
+@commands.cooldown(1, 5, commands.BucketType.user)     # Per-user: 1 use per 5s
+@commands.cooldown(2, 10, commands.BucketType.default)  # Global: 2 uses per 10
 async def counter(ctx, *, hero_name: str = None):
     """
     Show top 3 counters for the specified hero using COUNTER_HERO_LIST and
@@ -803,6 +805,8 @@ async def counter(ctx, *, hero_name: str = None):
 
 
 @mlbb.command(name="ranks")
+@commands.cooldown(1, 5, commands.BucketType.user)    # Per-user: 1 use per 5s
+@commands.cooldown(2, 10, commands.BucketType.default)  # Global: 2 uses per 10
 async def ranks(ctx, rank_filter: str = "all", days_filter: int = 7):
     """
     Show top 10 hero rankings.
@@ -966,7 +970,8 @@ async def ranks(ctx, rank_filter: str = "all", days_filter: int = 7):
 
 
 @mlbb.command(name="synergy")
-@commands.cooldown(1, 5, commands.BucketType.user)  # 1 use per 5 seconds per
+@commands.cooldown(1, 5, commands.BucketType.user)     # Per-user: 1 use per 5s
+@commands.cooldown(2, 15, commands.BucketType.default)  # Global: 2 uses per 15
 async def mlbb_synergy(ctx, *, hero_name: str = None):
     """
     Show advanced synergy and anti-synergy stats for a hero, including
@@ -1122,7 +1127,8 @@ async def mlbb_synergy(ctx, *, hero_name: str = None):
 
 
 @mlbb.command(name="roast")
-@commands.cooldown(1, 10, commands.BucketType.user)  # 1 use per 10 seconds per
+@commands.cooldown(1, 10, commands.BucketType.user)   # Per-user: 1 use per 10s
+@commands.cooldown(2, 20, commands.BucketType.default)  # Global: 2 uses per 20
 async def roast(ctx, member: discord.Member = None):
     """
     Delivers a hilarious roast to a user or the invoker.
