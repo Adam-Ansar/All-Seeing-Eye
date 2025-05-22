@@ -26,8 +26,8 @@ All-Seeing-Eye is a feature-rich Discord bot for [Mobile Legends: Bang Bang (MLB
 ### 1. Prerequisites
 
 - Python 3.8+
-- [Discord bot token](https://discord.com/developers/applications)
-- [OpenAI API key](https://platform.openai.com/account/api-keys) (for advanced counter explanations)
+- Discord bot token
+- OpenAI API key (for advanced counter explanations)
 - The following Python packages:
   - `discord.py`
   - `python-dotenv`
