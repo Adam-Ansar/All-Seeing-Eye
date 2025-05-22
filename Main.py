@@ -105,7 +105,7 @@ async def fetch_and_cache_hero_data():
                 HERO_NAME_TO_ID_MAP[lower_hero_name] = hero_id_str
                 HERO_ID_TO_NAME_MAP[hero_id_str] = hero_name
                 hero_ids_to_fetch_details.append(hero_id_str)
-            
+
             print(f"DEBUG: Populated name-to-ID maps. Total heroes: "
                   f"{len(HERO_NAME_TO_ID_MAP)}")
 
@@ -135,7 +135,7 @@ async def fetch_and_cache_hero_data():
             # Create tasks for all detail fetches, passing the session
             tasks = [fetch_hero_detail(session, hid) for hid in
                      hero_ids_to_fetch_details]
-            
+
             # Run tasks concurrently, capturing exceptions
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -214,6 +214,11 @@ async def on_ready():
     """Handle bot startup."""
     print(f"✅ {bot.user} is connected to Discord!")
     print(f"Guilds: {len(bot.guilds)}")
+    # Leave unauthorized servers
+    for guild in bot.guilds:
+        if guild.id not in ALLOWED_GUILD_IDS:
+            print(f"Leaving unauthorized server: {guild.name} ({guild.id})")
+            await guild.leave()
     print("⏳ Caching hero data...")
     # Ensure caching completes before setting up background task
     success = await fetch_and_cache_hero_data()
@@ -221,7 +226,7 @@ async def on_ready():
         print("✅ Hero data cache complete.")
     else:
         print("❌ Hero data cache failed on startup.")
-    
+
     # Start background refresh task only once after initial caching
     if not hasattr(bot, "hero_refresh_task"):
         bot.hero_refresh_task = bot.loop.create_task(
@@ -229,6 +234,32 @@ async def on_ready():
         )
         print("DEBUG: Background hero refresh task scheduled.")
 
+
+@bot.event
+async def on_guild_join(guild):
+    if guild.id not in ALLOWED_GUILD_IDS:
+        print(
+            f"Bot was added to unauthorized server: {guild.name} "
+            f"({guild.id}). Leaving..."
+        )
+        await guild.leave()
+    else:
+        print(f"Bot joined authorized server: {guild.name} ({guild.id})")
+
+
+# ====== Restrict Bot to Specific Guilds ======
+ALLOWED_GUILD_IDS = [
+    1349123127006728243,
+    1141162319569756230,
+    1359311947291430962,
+    1360066145029197914,
+]
+
+
+def guild_only():
+    async def predicate(ctx):
+        return ctx.guild and ctx.guild.id in ALLOWED_GUILD_IDS
+    return commands.check(predicate)
 
 # =========================
 # Command Groups & Commands
@@ -238,6 +269,7 @@ async def on_ready():
 
 
 @bot.group(name="mlbb", invoke_without_command=True)
+@guild_only()
 async def mlbb(ctx):
     """Main command group for MLBB features."""
     embed = discord.Embed(
@@ -342,7 +374,7 @@ async def trivia(ctx):
         elif qtype == "background":
             bg = clean_html_tags(hero_info.get("background", ""))
             hero_name = HERO_ID_TO_NAME_MAP.get(hero_id, "Unknown Hero")
-            
+
             # Split background into sentences and try to pick one
             sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', bg)
                          if s.strip()]
@@ -364,7 +396,7 @@ async def trivia(ctx):
                 chosen_excerpt = random.choice(sentences)
                 if len(chosen_excerpt) > 150:  # Truncate long sentences
                     chosen_excerpt = chosen_excerpt[:150] + "..."
-                
+
                 correct_answer = hero_name.lower()
                 question_text = (f"I am thinking of a hero whose background "
                                  f"story includes: \"*{chosen_excerpt}*\". "
@@ -391,7 +423,7 @@ async def trivia(ctx):
         try:
             msg = await ctx.bot.wait_for('message', timeout=30.0, check=check)
             user_answer = msg.content.strip().lower()
-            
+
             similarity = fuzz.WRatio(user_answer, correct_answer.lower())
             if similarity >= 85:
                 await ctx.send(
@@ -691,7 +723,7 @@ async def counter(ctx, *, hero_name: str = None):
     for idx, counter_hero in enumerate(top_counters, 1):
         counter_id = HERO_NAME_TO_ID_MAP.get(counter_hero.lower())
         counter_name = counter_hero
-        
+
         # Ensure counter_id is not None before proceeding to fetch details
         if not counter_id:
             print(f"DEBUG: Skipping counter '{counter_name}' as its ID was "
@@ -699,7 +731,7 @@ async def counter(ctx, *, hero_name: str = None):
             continue  # Skip this counter if its ID isn't in the map
 
         counter_full_data = HERO_DETAILS_CACHE.get(counter_id, {})
-        
+
         # Corrected path to the nested hero data within the full detail JSON
         hero_details_for_counter = (
             counter_full_data.get("data", {})
