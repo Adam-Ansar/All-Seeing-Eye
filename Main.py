@@ -932,8 +932,7 @@ async def ranks(ctx, rank_filter: str = "all", days_filter: int = 7):
                     )
 
                 footer_text = (
-                    f"Requested by {ctx.author.display_name} • "
-                    f"Data from api-mobilelegends.vercel.app"
+                    f"Requested by {ctx.author.display_name}"
                 )
                 embed.set_footer(text=footer_text)
                 await ctx.send(embed=embed)
