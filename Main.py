@@ -1387,6 +1387,18 @@ async def eightball_error(ctx, error):
         )
         await ctx.send(embed=embed)
 
+
+@mlbb.command(name="ping")
+async def mlbb_ping(ctx):
+    """Check bot latency."""
+    latency = ctx.bot.latency * 1000  # Convert to ms
+    embed = discord.Embed(
+        title="🏓 Pong!",
+        description=f"Bot latency: `{latency:.2f} ms`",
+        color=COLORS["info"]
+    )
+    await ctx.send(embed=embed)
+
 # =========================
 # Run the Bot
 # =========================
