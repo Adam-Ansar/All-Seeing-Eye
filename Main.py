@@ -10,6 +10,7 @@ from threading import Lock
 from thefuzz import fuzz, process
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands
 from counter_hero_list import mlbb_hero_counters as COUNTER_HERO_LIST
 import openai
@@ -47,7 +48,7 @@ COLORS = {
 bot_start_time = time.time()  # Track bot start time
 
 bot = commands.Bot(
-    command_prefix="!",
+    command_prefix=commands.when_mentioned,
     intents=intents,
     help_command=None,
 
@@ -55,6 +56,7 @@ bot = commands.Bot(
         type=discord.ActivityType.watching, name="MLBB Statistics"
     ),
 )
+bot.tree_synced = False
 
 
 # =========================
@@ -449,6 +451,13 @@ async def on_ready():
         )
         print("DEBUG: Background hero refresh task scheduled.")
 
+    if not getattr(bot, "tree_synced", False):
+        guild_objects = [discord.Object(id=g) for g in ALLOWED_GUILD_IDS]
+        for guild_obj in guild_objects:
+            await bot.tree.sync(guild=guild_obj)
+        bot.tree_synced = True
+        print("✅ Slash commands synced for authorized guilds.")
+
 
 @bot.event
 async def on_guild_join(guild):
@@ -472,9 +481,19 @@ ALLOWED_GUILD_IDS = [
 
 
 def guild_only():
-    async def predicate(ctx):
+    async def predicate_ctx(ctx):
         return ctx.guild and ctx.guild.id in ALLOWED_GUILD_IDS
-    return commands.check(predicate)
+
+    def predicate_interaction(interaction: discord.Interaction):
+        return interaction.guild and interaction.guild.id in ALLOWED_GUILD_IDS
+
+    def decorator(func):
+        wrapped = commands.check(predicate_ctx)(func)
+        if hasattr(wrapped, "app_command"):
+            wrapped.app_command.checks.append(app_commands.check(predicate_interaction))
+        return wrapped
+
+    return decorator
 
 # =========================
 # Command Groups & Commands
@@ -483,10 +502,7 @@ def guild_only():
 # ---- MLBB Command Group ----
 
 
-@bot.group(name="mlbb", invoke_without_command=True)
-@guild_only()
-async def mlbb(ctx):
-    """Main command group for MLBB features."""
+async def send_mlbb_menu(ctx):
     embed = discord.Embed(
         title="🏆 Mobile Legends: Bang Bang Bot",
         description="Your ultimate companion for MLBB statistics and fun!",
@@ -495,46 +511,73 @@ async def mlbb(ctx):
     embed.add_field(
         name="📊 Hero & Game Stats",
         value=(
-            "• `!mlbb ranks [rank] [days]` — Top 10 hero rankings\n"
-            "• `!mlbb counter [hero]` — Top 3 counters for a hero\n"
-            "• `!mlbb synergy [hero]` — Synergy & anti-synergy stats\n"
-            "• `!mlbb pick` — Get a random hero suggestion\n"
-            "• `!mlbb role pick` — Get a random role to play"
+            "• `/mlbb ranks [rank] [days]` — Top 10 hero rankings\n"
+            "• `/mlbb counter [hero]` — Top 3 counters for a hero\n"
+            "• `/mlbb synergy [hero]` — Synergy & anti-synergy stats\n"
+            "• `/mlbb pick` — Get a random hero suggestion\n"
+            "• `/mlbb role pick` — Get a random role to play"
         ),
         inline=False,
     )
     embed.add_field(
         name="🎮 Fun & Utility",
         value=(
-            "• `!mlbb trivia` — Start a MLBB trivia game *(moderator-only)*\n"
-            "• `!mlbb ping` — Check bot latency\n"
-            "• `!mlbb uptime` — Show bot uptime\n"
-            "• `!mlbb 8ball [question]` — Ask the Magic 8-Ball\n"
-            "• `!mlbb roast [@user]` — Roast yourself or a friend\n"
-            "• `!mlbb compliment [@user]`  - Compliment yourself or a friend\n"
-            "• `!mlbb crazy` — No idea what this is... did I code that?\n"
-            "• `!mlbb help` — Show detailed help for all commands"
+            "• `/mlbb trivia` — Start a MLBB trivia game *(moderator-only)*\n"
+            "• `/mlbb ping` — Check bot latency\n"
+            "• `/mlbb uptime` — Show bot uptime\n"
+            "• `/mlbb 8ball [question]` — Ask the Magic 8-Ball\n"
+            "• `/mlbb roast [user]` — Roast yourself or a friend\n"
+            "• `/mlbb compliment [user]`  - Compliment yourself or a friend\n"
+            "• `/mlbb crazy` — No idea what this is... did I code that?\n"
+            "• `/mlbb help` — Show detailed help for all commands"
         ),
         inline=False,
     )
     embed.add_field(
         name="🏟 Tournament Tools",
         value=(
-            "• `!mlbb tourney signup` — Register as a solo or duo for events\n"
-            "• `!mlbb tourney list` — Mods can review the signup list"
+            "• `/mlbb tourney signup` — Register as a solo or duo for events\n"
+            "• `/mlbb tourney list` — Mods can review the signup list\n"
+            "• `/mlbb tourney overview` — Learn how moderators form teams"
         ),
         inline=False,
     )
     embed.set_footer(
         text=(
             f"Requested by {ctx.author.display_name} • "
-            "Use !mlbb help for more details."
+            "Use /mlbb help for more details."
         )
     )
     await ctx.send(embed=embed)
 
 
-@mlbb.command(name="trivia")
+@commands.hybrid_group(
+    name="mlbb",
+    invoke_without_command=True,
+    with_app_command=True,
+    description="Mobile Legends: Bang Bang commands"
+)
+@guild_only()
+async def mlbb(ctx):
+    """Main command group for MLBB features."""
+    await send_mlbb_menu(ctx)
+
+
+@mlbb.command(
+    name="menu",
+    with_app_command=True,
+    description="Show the MLBB command overview"
+)
+@guild_only()
+async def mlbb_menu(ctx):
+    await send_mlbb_menu(ctx)
+
+
+@mlbb.command(
+    name="trivia",
+    with_app_command=True,
+    description="Start a MLBB trivia game"
+)
 @commands.has_permissions(manage_messages=True)
 async def trivia(ctx):
     """Start a MLBB trivia game (moderator-only)."""
@@ -709,7 +752,7 @@ async def trivia(ctx):
 
 @trivia.error
 async def trivia_error(ctx, error):
-    if isinstance(error, commands.MissingPermissions):
+    if isinstance(error, (commands.MissingPermissions, app_commands.MissingPermissions)):
         await ctx.send(
             embed=discord.Embed(
                 title="🚫 Permission Denied",
@@ -730,7 +773,7 @@ async def trivia_error(ctx, error):
 
 # ---- Update Help Command ----
 
-@mlbb.command(name="help")
+@mlbb.command(name="help", with_app_command=True, description="Show MLBB help and support")
 async def help_command(ctx):
     """Show detailed help and support for MLBB commands."""
     embed = discord.Embed(
@@ -745,55 +788,52 @@ async def help_command(ctx):
     embed.add_field(
         name="Hero & Game Stats",
         value=(
-            "`!mlbb ranks [rank] [days]` — Top 10 hero rankings.\n"
+            "`/mlbb ranks [rank] [days]` — Top 10 hero rankings.\n"
             "• `rank`: all, epic, legend, mythic, honor, glory\n"
             "• `days`: 7 or 30\n"
-            "Example: `!mlbb ranks mythic 30`\n"
-            "`!mlbb counter [hero]` — Top 3 counters for a hero, "
+            "Example: `/mlbb ranks mythic 30`\n"
+            "`/mlbb counter [hero]` — Top 3 counters for a hero, "
             "with details.\n"
-            "`!mlbb synergy [hero]` — Synergy & anti-synergy stats "
+            "`/mlbb synergy [hero]` — Synergy & anti-synergy stats "
             "for a hero.\n"
-            "`!mlbb pick` — Get a random hero suggestion.\n"
-            "`!mlbb role pick` — Get a random role to play."
+            "`/mlbb pick` — Get a random hero suggestion.\n"
+            "`/mlbb role pick` — Get a random role to play."
         ),
         inline=False,
     )
     embed.add_field(
         name="Fun & Utility",
         value=(
-            "`!mlbb trivia` — Start a MLBB trivia game *(moderator-only)*\n"
-            "`!mlbb ping` — Check bot latency.\n"
-            "`!mlbb uptime` — Show bot uptime.\n"
-            "`!mlbb 8ball [question]` — Ask the Magic 8-Ball.\n"
-            "`!mlbb roast` — Roast yourself or a friend.\n"
-            "`!mlbb crazy` — No idea who added that\n"
-            "`!mlbb help` — Show this help and support menu."
+            "`/mlbb trivia` — Start a MLBB trivia game *(moderator-only)*\n"
+            "`/mlbb ping` — Check bot latency.\n"
+            "`/mlbb uptime` — Show bot uptime.\n"
+            "`/mlbb 8ball [question]` — Ask the Magic 8-Ball.\n"
+            "`/mlbb roast` — Roast yourself or a friend.\n"
+            "`/mlbb crazy` — No idea who added that\n"
+            "`/mlbb help` — Show this help and support menu."
         ),
         inline=False
     )
     embed.add_field(
         name="Tournament Support",
         value=(
-            "`!mlbb tourney signup` — Register as a solo or duo.\n"
-            "`!mlbb tourney list` — Moderators can review signups."
+            "`/mlbb tourney signup` — Register as a solo or duo.\n"
+            "`/mlbb tourney list` — Moderators can review signups."
         ),
         inline=False
     )
     embed.add_field(
         name="Role Commands",
         value=(
-            "`!mlbb role` — Show role command help.\n"
-            "`!mlbb role pick` — Get a random role to play."
+            "`/mlbb role` — Show role command help.\n"
+            "`/mlbb role pick` — Get a random role to play."
         ),
         inline=False
     )
     await ctx.send(embed=embed)
 
 
-@mlbb.group(name="tourney", invoke_without_command=True)
-@guild_only()
-async def mlbb_tourney(ctx):
-    """Overview of tournament registration commands."""
+async def send_tourney_overview(ctx):
     embed = discord.Embed(
         title="🏟 MLBB Tournament Registration",
         description=(
@@ -806,7 +846,7 @@ async def mlbb_tourney(ctx):
     embed.add_field(
         name="Players",
         value=(
-            "• `!mlbb tourney signup` — Register alone or with a duo partner.\n"
+            "• `/mlbb tourney signup` — Register alone or with a duo partner.\n"
             "  Provide your MLBB ID and peak rank when prompted."
         ),
         inline=False,
@@ -814,7 +854,7 @@ async def mlbb_tourney(ctx):
     embed.add_field(
         name="Moderators",
         value=(
-            "• `!mlbb tourney list` — Review current solo and duo signups.\n"
+            "• `/mlbb tourney list` — Review current solo and duo signups.\n"
             "  Use this when building balanced teams."
         ),
         inline=False,
@@ -828,7 +868,29 @@ async def mlbb_tourney(ctx):
     await ctx.send(embed=embed)
 
 
-@mlbb_tourney.command(name="signup")
+@mlbb.group(
+    name="tourney",
+    invoke_without_command=True,
+    with_app_command=True,
+    description="Tournament registration commands"
+)
+@guild_only()
+async def mlbb_tourney(ctx):
+    """Overview of tournament registration commands."""
+    await send_tourney_overview(ctx)
+
+
+@mlbb_tourney.command(
+    name="overview",
+    with_app_command=True,
+    description="Show the tournament registration overview"
+)
+@guild_only()
+async def mlbb_tourney_overview(ctx):
+    await send_tourney_overview(ctx)
+
+
+@mlbb_tourney.command(name="signup", with_app_command=True, description="Register for the tournament")
 @guild_only()
 @commands.cooldown(1, 10, commands.BucketType.user)
 async def tourney_signup(ctx):
@@ -845,6 +907,8 @@ async def tourney_signup(ctx):
             )
         )
         return
+
+    await ctx.defer()
 
     signup_choice = None
     for _ in range(3):
@@ -999,11 +1063,17 @@ async def tourney_signup(ctx):
     )
 
 
-@mlbb_tourney.command(name="list")
+@mlbb_tourney.command(
+    name="list",
+    with_app_command=True,
+    description="Let moderators review tournament registrations"
+)
 @guild_only()
 @commands.has_permissions(manage_messages=True)
 async def tourney_list(ctx):
     """Allow moderators to inspect current tournament registrations."""
+    await ctx.defer()
+
     snapshot = get_tourney_snapshot()
     solos = snapshot.get("solos", [])
     duos = snapshot.get("duos", [])
@@ -1088,7 +1158,7 @@ async def tourney_list(ctx):
 
 @tourney_list.error
 async def tourney_list_error(ctx, error):
-    if isinstance(error, commands.MissingPermissions):
+    if isinstance(error, (commands.MissingPermissions, app_commands.MissingPermissions)):
         await ctx.send(
             embed=discord.Embed(
                 title="🚫 Permission Required",
@@ -1104,7 +1174,11 @@ async def tourney_list_error(ctx, error):
 
 
 # ---- Hero Commands ----
-@mlbb.command(name="pick")
+@mlbb.command(
+    name="pick",
+    with_app_command=True,
+    description="Get a random hero suggestion"
+)
 @commands.cooldown(1, 5, commands.BucketType.user)  # 1 use per 5 seconds per
 async def random_hero(ctx):
     """Randomly select a hero for players to use."""
@@ -1130,7 +1204,11 @@ async def random_hero(ctx):
     await ctx.send(embed=embed)
 
 
-@mlbb.command(name="counter")
+@mlbb.command(
+    name="counter",
+    with_app_command=True,
+    description="Show counters for a hero"
+)
 @commands.cooldown(1, 5, commands.BucketType.user)     # Per-user: 1 use per 5s
 @commands.cooldown(2, 10, commands.BucketType.default)  # Global: 2 uses per 10
 async def counter(ctx, *, hero_name: str = None):
@@ -1151,12 +1229,14 @@ async def counter(ctx, *, hero_name: str = None):
         embed = discord.Embed(
             title="⚠️ Hero Name Required",
             description=(
-                "Please specify a hero name. Example: `!mlbb counter Ling`"
+                "Please specify a hero name. Example: `/mlbb counter Ling`"
             ),
             color=COLORS["error"],
         )
         await ctx.send(embed=embed)
         return
+
+    await ctx.defer()
 
     hero_key = hero_name.strip().lower()
     hero_id = HERO_NAME_TO_ID_MAP.get(hero_key)
@@ -1174,7 +1254,7 @@ async def counter(ctx, *, hero_name: str = None):
                 title="⚠️ Hero Not Found",
                 description=(
                     f"Hero '{hero_name}' not found. Check spelling.\n"
-                    "Try `!mlbb pick` for an example."
+                    "Try `/mlbb pick` for an example."
                 ),
                 color=COLORS["error"],
             )
@@ -1348,19 +1428,25 @@ async def counter(ctx, *, hero_name: str = None):
     await ctx.send(embed=embed)
 
 
-@mlbb.command(name="ranks")
+@mlbb.command(
+    name="ranks",
+    with_app_command=True,
+    description="Show top hero rankings"
+)
 @commands.cooldown(1, 5, commands.BucketType.user)    # Per-user: 1 use per 5s
 @commands.cooldown(2, 10, commands.BucketType.default)  # Global: 2 uses per 10
 async def ranks(ctx, rank_filter: str = "all", days_filter: int = 7):
     """
     Show top 10 hero rankings.
-    Usage: !mlbb ranks [rank_filter] [days_filter]
+    Usage: /mlbb ranks [rank_filter] [days_filter]
     """
     valid_ranks = ["all", "epic", "legend", "mythic", "honor", "glory"]
     if rank_filter.lower() not in valid_ranks:
         rank_filter = "all"
     if days_filter not in [7, 30]:
         days_filter = 7
+
+    await ctx.defer()
 
     api_url = (
         f"{BASE_API_URL}hero-rank/?rank={rank_filter.lower()}"
@@ -1512,14 +1598,18 @@ async def ranks(ctx, rank_filter: str = "all", days_filter: int = 7):
         await ctx.send(embed=error_embed)
 
 
-@mlbb.command(name="synergy")
+@mlbb.command(
+    name="synergy",
+    with_app_command=True,
+    description="Show synergy data for a hero"
+)
 @commands.cooldown(1, 5, commands.BucketType.user)     # Per-user: 1 use per 5s
 @commands.cooldown(2, 15, commands.BucketType.default)  # Global: 2 uses per 15
 async def mlbb_synergy(ctx, *, hero_name: str = None):
     """
     Show advanced synergy and anti-synergy stats for a hero, including
     best/worst partners, win/appearance rates, and time-segment trends.
-    Usage: !mlbb synergy [hero]
+    Usage: /mlbb synergy [hero]
     """
     if not HERO_NAME_TO_ID_MAP or not HERO_DETAILS_CACHE:
         await ctx.send(embed=discord.Embed(
@@ -1533,11 +1623,13 @@ async def mlbb_synergy(ctx, *, hero_name: str = None):
         await ctx.send(embed=discord.Embed(
             title="⚠️ Hero Name Required",
             description=(
-                "Please specify a hero name. Example: `!mlbb synergy Ling`"
+                "Please specify a hero name. Example: `/mlbb synergy Ling`"
             ),
             color=COLORS["error"],
         ))
         return
+
+    await ctx.defer()
 
     hero_key = hero_name.strip().lower()
     hero_id = HERO_NAME_TO_ID_MAP.get(hero_key)
@@ -1669,13 +1761,17 @@ async def mlbb_synergy(ctx, *, hero_name: str = None):
     await ctx.send(embed=embed)
 
 
-@mlbb.command(name="roast")
+@mlbb.command(
+    name="roast",
+    with_app_command=True,
+    description="Send a playful roast"
+)
 @commands.cooldown(1, 10, commands.BucketType.user)   # Per-user: 1 use per 10s
 @commands.cooldown(2, 20, commands.BucketType.default)  # Global: 2 uses per 20
 async def roast(ctx, member: discord.Member = None):
     """
     Delivers a hilarious roast to a user or the invoker.
-    Usage: !mlbb roast [optional @user]
+    Usage: /mlbb roast [optional @user]
     """
     roast_lines = [
         "Your win rate is so low, even AFK players question your dedication.",
@@ -1718,7 +1814,11 @@ async def roast(ctx, member: discord.Member = None):
     await ctx.send(embed=embed)
 
 
-@mlbb.command(name="crazy")
+@mlbb.command(
+    name="crazy",
+    with_app_command=True,
+    description="Share the classic crazy copypasta"
+)
 @commands.cooldown(1, 10, commands.BucketType.user)  # 1 use per 10 seconds per
 async def mlbb_crazy(ctx):
     """Responds with the 'crazy' copypasta."""
@@ -1733,12 +1833,16 @@ async def mlbb_crazy(ctx):
     await ctx.send("\n".join(lines))
 
 
-@mlbb.command(name="8ball")
+@mlbb.command(
+    name="8ball",
+    with_app_command=True,
+    description="Consult the magic 8-Ball"
+)
 @commands.cooldown(1, 5, commands.BucketType.user)  # 1 use per 5 seconds per
 async def eightball(ctx, *, question: str):
     """
     Ask the Magic 8-Ball a question.
-    Usage: !mlbb 8ball [your question]
+    Usage: /mlbb 8ball [your question]
     """
     responses = [
         "It is certain.",
@@ -1785,7 +1889,11 @@ async def eightball(ctx, *, question: str):
     await ctx.send(embed=embed)
 
 
-@mlbb.command(name="uptime")
+@mlbb.command(
+    name="uptime",
+    with_app_command=True,
+    description="Check how long the bot has been running"
+)
 async def mlbb_uptime(ctx):
     """Show how long the bot has been running."""
     uptime_seconds = int(time.time() - bot_start_time)
@@ -1806,17 +1914,35 @@ async def mlbb_uptime(ctx):
 # ---- Role Command Group ----
 
 
-@mlbb.group(name="role", invoke_without_command=True)
-async def mlbb_role(ctx):
-    """Group for role-related commands."""
+async def send_role_overview(ctx):
     embed = discord.Embed(
         title="🎭 MLBB Role Commands",
-        description="Use `!mlbb role pick` to get a random role.",
+        description="Use `/mlbb role pick` to get a random role.",
     )
     await ctx.send(embed=embed)
 
 
-@mlbb_role.command(name="pick")
+@mlbb.group(
+    name="role",
+    invoke_without_command=True,
+    with_app_command=True,
+    description="Role-related utilities"
+)
+async def mlbb_role(ctx):
+    """Group for role-related commands."""
+    await send_role_overview(ctx)
+
+
+@mlbb_role.command(
+    name="info",
+    with_app_command=True,
+    description="Show information about role commands"
+)
+async def mlbb_role_info(ctx):
+    await send_role_overview(ctx)
+
+
+@mlbb_role.command(name="pick", with_app_command=True, description="Get a random MLBB role")
 async def mlbb_role_pick(ctx):
     """Randomly select a role for the player."""
     roles = ["Tank", "Fighter", "Assassin", "Mage", "Marksman", "Support"]
@@ -1829,12 +1955,16 @@ async def mlbb_role_pick(ctx):
     await ctx.send(embed=embed)
 
 
-@mlbb.command(name="compliment")
+@mlbb.command(
+    name="compliment",
+    with_app_command=True,
+    description="Send a wholesome compliment"
+)
 @commands.cooldown(1, 10, commands.BucketType.user)  # 1 use per 10 seconds
 async def compliment(ctx, member: discord.Member = None):
     """
     Delivers a wholesome compliment to a user or the invoker.
-    Usage: !mlbb compliment [optional @user]
+    Usage: /mlbb compliment [optional @user]
     """
     compliment_lines = [
         "Your map awareness is sharper than a Ling dash!",
@@ -1879,13 +2009,16 @@ async def compliment(ctx, member: discord.Member = None):
 
 @compliment.error
 async def compliment_error(ctx, error):
-    if isinstance(error, commands.CommandOnCooldown):
+    if isinstance(error, (commands.CommandOnCooldown, app_commands.CommandOnCooldown)):
+        retry_after = getattr(error, "retry_after", None)
+        retry_text = (
+            f" Try again in `{retry_after:.1f}` seconds."
+            if retry_after is not None
+            else ""
+        )
         embed = discord.Embed(
             title="⏳ Slow Down!",
-            description=(
-                "That command is on cooldown. "
-                f"Try again in `{error.retry_after:.1f}` seconds."
-            ),
+            description=f"That command is on cooldown.{retry_text}",
             color=COLORS["error"]
         )
         await ctx.send(embed=embed)
@@ -1893,13 +2026,16 @@ async def compliment_error(ctx, error):
 
 @roast.error
 async def roast_error(ctx, error):
-    if isinstance(error, commands.CommandOnCooldown):
+    if isinstance(error, (commands.CommandOnCooldown, app_commands.CommandOnCooldown)):
+        retry_after = getattr(error, "retry_after", None)
+        retry_text = (
+            f" Try again in `{retry_after:.1f}` seconds."
+            if retry_after is not None
+            else ""
+        )
         embed = discord.Embed(
             title="⏳ Whoa There!",
-            description=(
-                "Roast is on cooldown. "
-                f"Try again in `{error.retry_after:.1f}` seconds."
-            ),
+            description=f"Roast is on cooldown.{retry_text}",
             color=COLORS["error"]
         )
         await ctx.send(embed=embed)
@@ -1907,13 +2043,16 @@ async def roast_error(ctx, error):
 
 @mlbb_crazy.error
 async def crazy_error(ctx, error):
-    if isinstance(error, commands.CommandOnCooldown):
+    if isinstance(error, (commands.CommandOnCooldown, app_commands.CommandOnCooldown)):
+        retry_after = getattr(error, "retry_after", None)
+        retry_text = (
+            f" Try again in `{retry_after:.1f}` seconds."
+            if retry_after is not None
+            else ""
+        )
         embed = discord.Embed(
             title="⏳ Not So Fast!",
-            description=(
-                "That command is on cooldown. "
-                f"Try again in `{error.retry_after:.1f}` seconds."
-            ),
+            description=f"That command is on cooldown.{retry_text}",
             color=COLORS["error"]
         )
         await ctx.send(embed=embed)
@@ -1921,18 +2060,26 @@ async def crazy_error(ctx, error):
 
 @eightball.error
 async def eightball_error(ctx, error):
-    if isinstance(error, commands.CommandOnCooldown):
+    if isinstance(error, (commands.CommandOnCooldown, app_commands.CommandOnCooldown)):
+        retry_after = getattr(error, "retry_after", None)
+        retry_text = (
+            f" Try again in `{retry_after:.1f}` seconds."
+            if retry_after is not None
+            else ""
+        )
         embed = discord.Embed(
             title="⏳ Magic 8-Ball Needs a Break!",
-            description=(
-                f"Try again in `{error.retry_after:.1f}` seconds."
-            ),
+            description=f"Please wait before asking again.{retry_text}",
             color=COLORS["error"]
         )
         await ctx.send(embed=embed)
 
 
-@mlbb.command(name="ping")
+@mlbb.command(
+    name="ping",
+    with_app_command=True,
+    description="Check bot latency"
+)
 async def mlbb_ping(ctx):
     """Check bot latency."""
     latency = ctx.bot.latency * 1000  # Convert to ms
@@ -1942,6 +2089,66 @@ async def mlbb_ping(ctx):
         color=COLORS["info"]
     )
     await ctx.send(embed=embed)
+
+# =========================
+# Slash Command Cooldowns & Checks
+# =========================
+
+tourney_signup.app_command.checks.append(
+    app_commands.checks.cooldown(1, 10, key=lambda i: i.user.id)
+)
+
+random_hero.app_command.checks.append(
+    app_commands.checks.cooldown(1, 5, key=lambda i: i.user.id)
+)
+
+counter.app_command.checks.append(
+    app_commands.checks.cooldown(1, 5, key=lambda i: i.user.id)
+)
+counter.app_command.checks.append(
+    app_commands.checks.cooldown(2, 10, key=lambda i: 0)
+)
+
+ranks.app_command.checks.append(
+    app_commands.checks.cooldown(1, 5, key=lambda i: i.user.id)
+)
+ranks.app_command.checks.append(
+    app_commands.checks.cooldown(2, 10, key=lambda i: 0)
+)
+
+mlbb_synergy.app_command.checks.append(
+    app_commands.checks.cooldown(1, 5, key=lambda i: i.user.id)
+)
+mlbb_synergy.app_command.checks.append(
+    app_commands.checks.cooldown(2, 15, key=lambda i: 0)
+)
+
+roast.app_command.checks.append(
+    app_commands.checks.cooldown(1, 10, key=lambda i: i.user.id)
+)
+roast.app_command.checks.append(
+    app_commands.checks.cooldown(2, 20, key=lambda i: 0)
+)
+
+mlbb_crazy.app_command.checks.append(
+    app_commands.checks.cooldown(1, 10, key=lambda i: i.user.id)
+)
+
+eightball.app_command.checks.append(
+    app_commands.checks.cooldown(1, 5, key=lambda i: i.user.id)
+)
+
+compliment.app_command.checks.append(
+    app_commands.checks.cooldown(1, 10, key=lambda i: i.user.id)
+)
+
+trivia.app_command.checks.append(
+    app_commands.checks.has_permissions(manage_messages=True)
+)
+
+tourney_list.app_command.checks.append(
+    app_commands.checks.has_permissions(manage_messages=True)
+)
 
 # =========================
 # Run the Bot
